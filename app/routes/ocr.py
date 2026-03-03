@@ -162,45 +162,62 @@ async def _process(
 async def upload(request: Request, file: UploadFile = File(...)):
     user = getattr(request.state, "user", None)
 
-    if user:
-        allowed, used, limit = check_quota(user)
-        if not allowed:
-            raise HTTPException(
-                status_code=429,
-                detail="Aylık fatura limitinize ulaştınız."
-            )
+    if not user:
+        raise HTTPException(status_code=401, detail="Giriş gerekli.")
+
+    allowed, used, limit = check_quota(user)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Aylık fatura limitinize ulaştınız."
+        )
 
     result = await _process(
         file,
         qr_allowed=_plan_allows_qr(user),
-        user_id=user["id"] if user else None
+        user_id=user["id"]
     )
 
-    if user:
-        increment_usage(user["id"])
-
+    increment_usage(user["id"])
     return result
 
-
 @router.get("/review-queue")
-def review_queue(page: int = 1, per_page: int = 50):
-    return get_review_queue(page=page, per_page=per_page)
+def review_queue(request: Request, page: int = 1, per_page: int = 50):
+    user = getattr(request.state, "user", None)
 
+    if not user:
+        raise HTTPException(status_code=401, detail="Giriş gerekli.")
+
+    return get_review_queue(user["id"], page=page, per_page=per_page)
 
 @router.get("/invoice/{inv_id}")
-def get_one(inv_id: str):
-    inv = get_invoice(inv_id)
+def get_one(request: Request, inv_id: str):
+    user = getattr(request.state, "user", None)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Giriş gerekli.")
+
+    inv = get_invoice(inv_id, user["id"])
+
     if not inv:
         raise HTTPException(status_code=404, detail="Fatura bulunamadı.")
+
     return inv
 
 
 @router.patch("/invoice/{inv_id}")
-def patch_invoice(inv_id: str, fields: dict = Body(...)):
-    ok = update_invoice(inv_id, fields)
+def patch_invoice(request: Request, inv_id: str, fields: dict = Body(...)):
+    user = getattr(request.state, "user", None)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Giriş gerekli.")
+
+    ok = update_invoice(inv_id, user["id"], fields)
+
     if not ok:
         raise HTTPException(
             status_code=404,
             detail="Fatura bulunamadı veya güncellenemedi."
         )
+
     return {"status": "ok", "invoice_id": inv_id}
