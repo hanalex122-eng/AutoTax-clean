@@ -1,14 +1,16 @@
-import sqlite3
+import psycopg2
 import json
 import uuid
 from datetime import datetime, timedelta
-from pathlib import Path
 from threading import Lock
 from app.config import settings
 
-DB_PATH = Path(settings.SQLITE_PATH)
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _LOCK = Lock()
+
+
+def _conn():
+    return psycopg2.connect(settings.DATABASE_URL)
+
 
 DDL = """
 CREATE TABLE IF NOT EXISTS invoices (
@@ -32,72 +34,77 @@ CREATE TABLE IF NOT EXISTS invoices (
     invoice_type TEXT DEFAULT 'expense',
     user_id TEXT NOT NULL
 );
+
 CREATE INDEX IF NOT EXISTS idx_uid ON invoices(user_id);
 CREATE INDEX IF NOT EXISTS idx_ts ON invoices(timestamp DESC);
 """
 
-def _conn():
-    c = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
 
 def _init():
     with _conn() as c:
-        c.executescript(DDL)
+        with c.cursor() as cur:
+            cur.execute(DDL)
+        c.commit()
+
 
 _init()
 
-# --------------------------
-# ADD
-# --------------------------
 
 def add_invoice(record: dict, filename: str, user_id: str) -> str:
     inv_id = str(uuid.uuid4())
+
     with _LOCK:
         with _conn() as c:
-            c.execute("""
-                INSERT INTO invoices VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                inv_id,
-                filename,
-                datetime.utcnow().isoformat(),
-                record.get("vendor"),
-                record.get("date"),
-                record.get("time"),
-                record.get("total"),
-                record.get("vat_rate"),
-                record.get("vat_amount"),
-                record.get("invoice_number"),
-                record.get("category"),
-                record.get("payment_method"),
-                (record.get("qr_raw") or "")[:500],
-                json.dumps(record.get("qr_parsed")) if record.get("qr_parsed") else None,
-                (record.get("raw_text") or "")[:5000],
-                1 if record.get("needs_review") else 0,
-                record.get("review_reason"),
-                record.get("invoice_type", "expense"),
-                user_id
-            ))
+            with c.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO invoices VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        inv_id,
+                        filename,
+                        datetime.utcnow().isoformat(),
+                        record.get("vendor"),
+                        record.get("date"),
+                        record.get("time"),
+                        record.get("total"),
+                        record.get("vat_rate"),
+                        record.get("vat_amount"),
+                        record.get("invoice_number"),
+                        record.get("category"),
+                        record.get("payment_method"),
+                        (record.get("qr_raw") or "")[:500],
+                        json.dumps(record.get("qr_parsed")) if record.get("qr_parsed") else None,
+                        (record.get("raw_text") or "")[:5000],
+                        1 if record.get("needs_review") else 0,
+                        record.get("review_reason"),
+                        record.get("invoice_type", "expense"),
+                        user_id,
+                    ),
+                )
+            c.commit()
+
     return inv_id
 
-# --------------------------
-# GET (IDOR SAFE)
-# --------------------------
 
 def get_invoice(inv_id: str, user_id: str):
     with _conn() as c:
-        row = c.execute(
-            "SELECT * FROM invoices WHERE id=? AND user_id=?",
-            (inv_id, user_id)
-        ).fetchone()
-    return dict(row) if row else None
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM invoices WHERE id=%s AND user_id=%s",
+                (inv_id, user_id),
+            )
+            row = cur.fetchone()
 
-# --------------------------
-# UPDATE (IDOR SAFE)
-# --------------------------
+            if not row:
+                return None
+
+            cols = [desc[0] for desc in cur.description]
+            return dict(zip(cols, row))
+
 
 def update_invoice(inv_id: str, user_id: str, fields: dict) -> bool:
+
     allowed = {
         "vendor","date","time","total",
         "vat_rate","vat_amount",
@@ -109,90 +116,228 @@ def update_invoice(inv_id: str, user_id: str, fields: dict) -> bool:
     if not updates:
         return False
 
-    set_clause = ", ".join(f"{k}=?" for k in updates)
+    set_clause = ", ".join(f"{k}=%s" for k in updates)
     values = list(updates.values())
 
     with _LOCK:
         with _conn() as c:
-            cur = c.execute(
-                f"UPDATE invoices SET {set_clause} WHERE id=? AND user_id=?",
-                values + [inv_id, user_id]
-            )
-    return cur.rowcount > 0
+            with c.cursor() as cur:
+                cur.execute(
+                    f"UPDATE invoices SET {set_clause} WHERE id=%s AND user_id=%s",
+                    values + [inv_id, user_id],
+                )
+                updated = cur.rowcount
+            c.commit()
 
-# --------------------------
-# DELETE (SAFE)
-# --------------------------
+    return updated > 0
+
 
 def delete_invoice(inv_id: str, user_id: str) -> bool:
     with _LOCK:
         with _conn() as c:
-            cur = c.execute(
-                "DELETE FROM invoices WHERE id=? AND user_id=?",
-                (inv_id, user_id)
-            )
-    return cur.rowcount > 0
+            with c.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM invoices WHERE id=%s AND user_id=%s",
+                    (inv_id, user_id),
+                )
+                deleted = cur.rowcount
+            c.commit()
 
-# --------------------------
-# QUERY (MULTI TENANT SAFE)
-# --------------------------
+    return deleted > 0
+
 
 def query_invoices(user_id: str, page: int = 1, per_page: int = 50):
+
+    offset = (page - 1) * per_page
+
     with _conn() as c:
-        total = c.execute(
-            "SELECT COUNT(*) FROM invoices WHERE user_id=?",
-            (user_id,)
-        ).fetchone()[0]
+        with c.cursor() as cur:
 
-        offset = (page - 1) * per_page
+            cur.execute(
+                "SELECT COUNT(*) FROM invoices WHERE user_id=%s",
+                (user_id,),
+            )
+            total = cur.fetchone()[0]
 
-        rows = c.execute(
-            "SELECT * FROM invoices WHERE user_id=? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-            (user_id, per_page, offset)
-        ).fetchall()
+            cur.execute(
+                "SELECT * FROM invoices WHERE user_id=%s ORDER BY timestamp DESC LIMIT %s OFFSET %s",
+                (user_id, per_page, offset),
+            )
+
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+
+    invoices = [dict(zip(cols, r)) for r in rows]
 
     return {
         "count": total,
         "page": page,
         "per_page": per_page,
-        "invoices": [dict(r) for r in rows]
+        "invoices": invoices,
     }
 
-# --------------------------
-# REVIEW QUEUE (USER SAFE)
-# --------------------------
 
 def get_review_queue(user_id: str, page: int = 1, per_page: int = 50):
+
+    offset = (page - 1) * per_page
+
     with _conn() as c:
-        total = c.execute(
-            "SELECT COUNT(*) FROM invoices WHERE user_id=? AND needs_review=1",
-            (user_id,)
-        ).fetchone()[0]
+        with c.cursor() as cur:
 
-        offset = (page - 1) * per_page
+            cur.execute(
+                "SELECT COUNT(*) FROM invoices WHERE user_id=%s AND needs_review=1",
+                (user_id,),
+            )
+            total = cur.fetchone()[0]
 
-        rows = c.execute(
-            "SELECT * FROM invoices WHERE user_id=? AND needs_review=1 ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-            (user_id, per_page, offset)
-        ).fetchall()
+            cur.execute(
+                "SELECT * FROM invoices WHERE user_id=%s AND needs_review=1 ORDER BY timestamp DESC LIMIT %s OFFSET %s",
+                (user_id, per_page, offset),
+            )
+
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+
+    invoices = [dict(zip(cols, r)) for r in rows]
 
     return {
         "count": total,
         "page": page,
         "per_page": per_page,
-        "invoices": [dict(r) for r in rows]
+        "invoices": invoices,
     }
 
-# --------------------------
-# GDPR PURGE FIXED
-# --------------------------
 
 def purge_old_invoice_files(days: int = 90) -> int:
+
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
     with _LOCK:
         with _conn() as c:
-            cur = c.execute(
-                "DELETE FROM invoices WHERE timestamp < ?",
-                (cutoff,)
+            with c.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM invoices WHERE timestamp < %s",
+                    (cutoff,),
+                )
+                deleted = cur.rowcount
+            c.commit()
+
+    return deleted
+
+# --------------------------
+# DUPLICATE CHECK
+# --------------------------
+
+def find_duplicate(user_id: str, total: float, date: str, vendor: str):
+
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM invoices
+                WHERE user_id=%s
+                AND total=%s
+                AND date=%s
+                AND vendor=%s
+                LIMIT 1
+                """,
+                (user_id, total, date, vendor),
             )
-    return cur.rowcount
+
+            row = cur.fetchone()
+
+    if row:
+        return row[0]
+
+    return None
+
+# --------------------------
+# RECURRING CHECK
+# --------------------------
+
+def find_recurring(user_id: str, vendor: str):
+
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) 
+                FROM invoices
+                WHERE user_id=%s
+                AND vendor=%s
+                """,
+                (user_id, vendor),
+            )
+
+            count = cur.fetchone()[0]
+
+    return count >= 3
+
+# --------------------------
+# HELPERS FOR STATS
+# --------------------------
+
+def iter_rows(rows, cols):
+    for r in rows:
+        yield dict(zip(cols, r))
+
+
+def get_data(row, key, default=None):
+    if not row:
+        return default
+    return row.get(key, default)
+
+
+def safe_float(value):
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+# --------------------------
+# PAGINATION
+# --------------------------
+
+def get_invoices_page(user_id: str, page: int = 1, per_page: int = 50):
+
+    offset = (page - 1) * per_page
+
+    with _conn() as c:
+        with c.cursor() as cur:
+
+            cur.execute(
+                "SELECT * FROM invoices WHERE user_id=%s ORDER BY timestamp DESC LIMIT %s OFFSET %s",
+                (user_id, per_page, offset),
+            )
+
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+
+    return [dict(zip(cols, r)) for r in rows]
+
+
+# --------------------------
+# LEDGER
+# --------------------------
+
+def get_ledger(user_id: str):
+
+    with _conn() as c:
+        with c.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT date, vendor, total, category
+                FROM invoices
+                WHERE user_id=%s
+                ORDER BY date DESC
+                """,
+                (user_id,),
+            )
+
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+
+    return [dict(zip(cols, r)) for r in rows]    
