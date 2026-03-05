@@ -299,3 +299,38 @@ def get_ledger(user_id: str):
             cols = [desc[0] for desc in cur.description]
 
     return [dict(zip(cols, r)) for r in rows]
+
+def get_review_queue(user_id: str, page: int = 1, per_page: int = 50):
+
+    offset = (page - 1) * per_page
+
+    with _conn() as c:
+        with c.cursor() as cur:
+
+            cur.execute(
+                "SELECT COUNT(*) FROM invoices WHERE user_id=%s AND needs_review=1",
+                (user_id,),
+            )
+            total = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                SELECT * FROM invoices
+                WHERE user_id=%s AND needs_review=1
+                ORDER BY timestamp DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user_id, per_page, offset),
+            )
+
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+
+    invoices = [dict(zip(cols, r)) for r in rows]
+
+    return {
+        "count": total,
+        "page": page,
+        "per_page": per_page,
+        "invoices": invoices,
+    }
