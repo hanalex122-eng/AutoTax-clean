@@ -9,7 +9,10 @@ _LOCK = Lock()
 
 
 def _conn():
-    return psycopg2.connect(settings.DATABASE_URL)
+    return psycopg2.connect(
+        settings.DATABASE_URL,
+        sslmode="require"
+    )
 
 
 DDL = """
@@ -40,14 +43,16 @@ CREATE INDEX IF NOT EXISTS idx_ts ON invoices(timestamp DESC);
 """
 
 
-def _init():
-    with _conn() as c:
-        with c.cursor() as cur:
-            cur.execute(DDL)
-        c.commit()
-
-
-_init()
+def init_db():
+    try:
+        with _conn() as c:
+            with c.cursor() as cur:
+                cur.execute(DDL)
+            c.commit()
+        print("[AutoTax] Database schema ready", flush=True)
+    except Exception as e:
+        print(f"[AutoTax] Database init failed: {e}", flush=True)
+        raise
 
 
 def add_invoice(record: dict, filename: str, user_id: str) -> str:
@@ -177,37 +182,6 @@ def query_invoices(user_id: str, page: int = 1, per_page: int = 50):
     }
 
 
-def get_review_queue(user_id: str, page: int = 1, per_page: int = 50):
-
-    offset = (page - 1) * per_page
-
-    with _conn() as c:
-        with c.cursor() as cur:
-
-            cur.execute(
-                "SELECT COUNT(*) FROM invoices WHERE user_id=%s AND needs_review=1",
-                (user_id,),
-            )
-            total = cur.fetchone()[0]
-
-            cur.execute(
-                "SELECT * FROM invoices WHERE user_id=%s AND needs_review=1 ORDER BY timestamp DESC LIMIT %s OFFSET %s",
-                (user_id, per_page, offset),
-            )
-
-            rows = cur.fetchall()
-            cols = [desc[0] for desc in cur.description]
-
-    invoices = [dict(zip(cols, r)) for r in rows]
-
-    return {
-        "count": total,
-        "page": page,
-        "per_page": per_page,
-        "invoices": invoices,
-    }
-
-
 def purge_old_invoice_files(days: int = 90) -> int:
 
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -224,9 +198,6 @@ def purge_old_invoice_files(days: int = 90) -> int:
 
     return deleted
 
-# --------------------------
-# DUPLICATE CHECK
-# --------------------------
 
 def find_duplicate(user_id: str, total: float, date: str, vendor: str):
 
@@ -251,9 +222,6 @@ def find_duplicate(user_id: str, total: float, date: str, vendor: str):
 
     return None
 
-# --------------------------
-# RECURRING CHECK
-# --------------------------
 
 def find_recurring(user_id: str, vendor: str):
 
@@ -273,9 +241,6 @@ def find_recurring(user_id: str, vendor: str):
 
     return count >= 3
 
-# --------------------------
-# HELPERS FOR STATS
-# --------------------------
 
 def iter_rows(rows, cols):
     for r in rows:
@@ -296,9 +261,6 @@ def safe_float(value):
     except Exception:
         return 0.0
 
-# --------------------------
-# PAGINATION
-# --------------------------
 
 def get_invoices_page(user_id: str, page: int = 1, per_page: int = 50):
 
@@ -318,10 +280,6 @@ def get_invoices_page(user_id: str, page: int = 1, per_page: int = 50):
     return [dict(zip(cols, r)) for r in rows]
 
 
-# --------------------------
-# LEDGER
-# --------------------------
-
 def get_ledger(user_id: str):
 
     with _conn() as c:
@@ -340,4 +298,4 @@ def get_ledger(user_id: str):
             rows = cur.fetchall()
             cols = [desc[0] for desc in cur.description]
 
-    return [dict(zip(cols, r)) for r in rows]    
+    return [dict(zip(cols, r)) for r in rows]
