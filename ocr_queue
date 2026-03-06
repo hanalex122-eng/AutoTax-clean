@@ -1,0 +1,4 @@
+from queue import queue
+from ocr_worker import process_image
+
+job = queue.enqueue(process_image, "image.png")
